@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Traveler Agent</title>
+<style>
+  html,body{height:100%;margin:0;background:#000;color:#ddd;font-family:system-ui,Segoe UI,Roboto,Arial}
+  #top{display:flex;gap:8px;padding:10px;align-items:center;flex-wrap:wrap}
+  button,input,label{background:#111;color:#fff;border:1px solid #333;padding:6px 10px;border-radius:6px}
+  canvas{display:block;width:100%;height:calc(100vh - 64px);cursor:crosshair;background:#000}
+  .muted{color:#9aa;font-size:13px}
+</style>
+</head>
+<body>
+  <div id="top">
+    <button id="go">Go</button>
+    <button id="pause">Pause</button>
+    <button id="clear">Clear</button>
+    <label class="muted">Speed</label>
+    <input id="speed" type="range" min="50" max="1500" value="300">
+    <div id="speedVal" class="muted">300 px/s</div>
+    <label><input id="smooth" type="checkbox" checked> Smooth</label>
+    <label class="muted">Res</label><input id="res" type="number" min="4" max="200" value="36" style="width:64px">
+    <label><input id="loopChk" type="checkbox"> Loop</label>
+    <div class="muted">Waypoints: <span id="count">0</span> Length: <span id="len">0</span> px</div>
+  </div>
+  <canvas id="cv"></canvas>
+
+<script>
+(() => {
+  const canvas = document.getElementById('cv');
+  const ctx = canvas.getContext('2d');
+  const goBtn = document.getElementById('go');
+  const pauseBtn = document.getElementById('pause');
+  const clearBtn = document.getElementById('clear');
+  const speedRange = document.getElementById('speed');
+  const speedVal = document.getElementById('speedVal');
+  const smoothChk = document.getElementById('smooth');
+  const resInput = document.getElementById('res');
+  const loopChk = document.getElementById('loopChk');
+  const countEl = document.getElementById('count');
+  const lenEl = document.getElementById('len');
+
+  let DPR = Math.max(1, window.devicePixelRatio || 1);
+  function resize() {
+    DPR = Math.max(1, window.devicePixelRatio || 1);
+    const topH = document.getElementById('top').offsetHeight;
+    const w = canvas.clientWidth || document.documentElement.clientWidth;
+    const h = window.innerHeight - topH;
+    canvas.width = Math.floor((canvas.clientWidth || w) * DPR);
+    canvas.height = Math.floor(h * DPR);
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    draw();
+  }
+  window.addEventListener('resize', resize);
+  setTimeout(resize,0);
+
+  const dot = { x:0, y:0, r:8 };
+  const waypoints = [];
+  let dense = [];
+  let uniform = [];
+  let totalLen = 0;
+  let moving = false, paused = false;
+  let lastTime = null;
+  let travel = 0;
+  let speed = Number(speedRange.value);
+
+  function P(x,y){return {x:x,y:y};}
+  function cssPos(e){ const r=canvas.getBoundingClientRect(); return {x: e.clientX - r.left, y: e.clientY - r.top}; }
+  function dist(a,b){ return Math.hypot(a.x-b.x,a.y-b.y); }
+
+  function sampleCatmull(points, samplesPerSeg) {
+    if (points.length === 0) return [];
+    if (points.length === 1) return [P(points[0].x, points[0].y)];
+    const pts = [];
+    const ext = [points[0], ...points, points[points.length-1]];
+    for (let i = 0; i < ext.length - 2; i++) {
+      const p0 = ext[i];
+      const p1 = ext[i+1];
+      const p2 = ext[i+2];
+      const p_1 = i-1>=0 ? ext[i-1] : p0;
+      const p3 = i+3 < ext.length ? ext[i+3] : ext[ext.length-1];
+      for (let s = 0; s < samplesPerSeg; s++) {
+        const t = s / samplesPerSeg;
+        const t2 = t*t, t3 = t2*t;
+        const x = 0.5*((-p_1.x + 3*p1.x - 3*p2.x + p3.x)*t3 + (2*p_1.x -5*p1.x +4*p2.x - p3.x)*t2 + (-p_1.x + p2.x)*t + 2*p1.x);
+        const y = 0.5*((-p_1.y + 3*p1.y - 3*p2.y + p3.y)*t3 + (2*p_1.y -5*p1.y +4*p2.y - p3.y)*t2 + (-p_1.y + p2.y)*t + 2*p1.y);
+        pts.push(P(x,y));
+      }
+    }
+    pts.push(P(points[points.length-1].x, points[points.length-1].y));
+    return pts;
+  }
+
+  function buildDense() {
+    const res = Math.max(4, Math.min(200, Number(resInput.value) || 36));
+    if (!smoothChk.checked || waypoints.length < 2) {
+      dense = [{x:dot.x,y:dot.y}, ...waypoints.map(p=>({x:p.x,y:p.y}))];
+    } else {
+      const sampled = sampleCatmull(waypoints, res);
+      dense = [{x:dot.x,y:dot.y}, ...sampled];
+    }
+  }
+
+  function buildUniform() {
+    uniform = [];
+    if (dense.length < 2) { totalLen = 0; return; }
+    const segs = [];
+    let acc = 0;
+    segs.push({x:dense[0].x,y:dense[0].y,acc:0});
+    for (let i = 1; i < dense.length; i++) {
+      const a = dense[i-1], b = dense[i];
+      acc += dist(a,b);
+      segs.push({x:b.x,y:b.y,acc:acc});
+    }
+    totalLen = acc;
+    if (totalLen === 0) { uniform = segs.slice(); return; }
+    const baseSpacing = 2;
+    const spacing = Math.max(1, Math.round(baseSpacing * Math.max(1, 300/speed)));
+    for (let d = 0; d <= totalLen; d += spacing) {
+      let lo = 0, hi = segs.length - 1;
+      while (lo < hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (segs[mid].acc < d) lo = mid + 1; else hi = mid;
+      }
+      const idx = Math.max(1, lo);
+      const a = segs[idx-1], b = segs[idx];
+      const segLen = b.acc - a.acc;
+      const t = segLen === 0 ? 0 : (d - a.acc) / segLen;
+      const x = a.x + (b.x - a.x) * t;
+      const y = a.y + (b.y - a.y) * t;
+      uniform.push({x:x,y:y,acc:d});
+    }
+    const last = segs[segs.length-1];
+    if (uniform.length === 0 || uniform[uniform.length-1].acc < last.acc) {
+      uniform.push({x:last.x,y:last.y,acc:last.acc});
+    }
+  }
+
+  function rebuild(fullKeepTravel=false) {
+    buildDense();
+    buildUniform();
+    if (!fullKeepTravel) travel = 0;
+    else travel = Math.max(0, Math.min(travel, totalLen));
+    countEl.textContent = waypoints.length;
+    lenEl.textContent = Math.round(totalLen);
+    draw();
+  }
+
+  function sampleUniform(d) {
+    if (uniform.length === 0) return {x:dot.x,y:dot.y};
+    if (d <= 0) return {x:uniform[0].x,y:uniform[0].y};
+    if (d >= totalLen) {
+      const l = uniform[uniform.length-1];
+      return {x:l.x,y:l.y};
+    }
+    let lo = 0, hi = uniform.length - 1;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (uniform[mid].acc < d) lo = mid + 1; else hi = mid;
+    }
+    const idx = Math.max(1, lo);
+    const a = uniform[idx-1], b = uniform[idx];
+    const seg = b.acc - a.acc;
+    const t = seg === 0 ? 0 : (d - a.acc) / seg;
+    return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+  }
+
+  function draw() {
+    ctx.clearRect(0,0,canvas.width/DPR, canvas.height/DPR);
+    if (uniform.length > 1) {
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = '#39d353';
+      ctx.beginPath();
+      ctx.moveTo(uniform[0].x, uniform[0].y);
+      for (let i=1;i<uniform.length;i++) ctx.lineTo(uniform[i].x, uniform[i].y);
+      ctx.stroke();
+    }
+    for (let i=0;i<waypoints.length;i++){
+      const p = waypoints[i];
+      ctx.fillStyle = 'rgba(57,211,83,0.12)';
+      ctx.beginPath(); ctx.arc(p.x,p.y,6,0,Math.PI*2); ctx.fill();
+      ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(57,211,83,0.35)'; ctx.stroke();
+      ctx.fillStyle = '#39d353'; ctx.font='12px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(String(i+1), p.x, p.y);
+    }
+    ctx.fillStyle = '#d9534f';
+    ctx.beginPath(); ctx.arc(dot.x, dot.y, dot.r, 0, Math.PI*2); ctx.fill();
+    ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.stroke();
+    if (uniform.length) {
+      const pos = sampleUniform(travel);
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.beginPath(); ctx.arc(pos.x,pos.y,3,0,Math.PI*2); ctx.fill();
+    }
+    speedVal.textContent = speed + ' px/s';
+  }
+
+  function projectDotToPath() {
+    if (!uniform.length) return 0;
+    let bestAcc = 0, bestD = Infinity;
+    for (let i=1;i<uniform.length;i++){
+      const a = uniform[i-1], b = uniform[i];
+      const vx = b.x - a.x, vy = b.y - a.y;
+      const wx = dot.x - a.x, wy = dot.y - a.y;
+      const segLen2 = vx*vx + vy*vy;
+      const t = segLen2 === 0 ? 0 : Math.max(0, Math.min(1, (wx*vx + wy*vy) / segLen2));
+      const px = a.x + vx*t, py = a.y + vy*t;
+      const d = Math.hypot(px - dot.x, py - dot.y);
+      if (d < bestD) { bestD = d; bestAcc = a.acc + (b.acc - a.acc)*t; }
+    }
+    const pos = sampleUniform(bestAcc);
+    dot.x = pos.x; dot.y = pos.y;
+    return bestAcc;
+  }
+
+  function loop(ts) {
+    if (!lastTime) lastTime = ts;
+    const dt = (ts - lastTime) / 1000;
+    lastTime = ts;
+    if (moving && !paused && totalLen > 0) {
+      travel += speed * dt;
+      if (travel >= totalLen) {
+        if (loopChk.checked && totalLen > 0) {
+          // loop: wrap travel around and keep moving
+          travel = travel % totalLen;
+        } else {
+          travel = totalLen;
+          moving = false;
+        }
+      }
+      const pos = sampleUniform(travel);
+      dot.x = pos.x; dot.y = pos.y;
+      draw();
+    }
+    if (moving) requestAnimationFrame(loop);
+    else lastTime = null;
+  }
+
+  canvas.addEventListener('click', (e) => {
+    const p = cssPos(e);
+    waypoints.push(P(p.x,p.y));
+    rebuild(false);
+  });
+
+  canvas.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    const p = cssPos(e);
+    let best = -1, bd = 1e9;
+    for (let i=0;i<waypoints.length;i++){
+      const d = dist(waypoints[i], p);
+      if (d < bd) { bd = d; best = i; }
+    }
+    if (best !== -1 && bd < 20) { waypoints.splice(best,1); rebuild(false); }
+  });
+
+  goBtn.addEventListener('click', () => {
+    if (uniform.length < 2) return;
+    travel = projectDotToPath();
+    moving = true; paused = false; lastTime = null;
+    requestAnimationFrame(loop);
+  });
+
+  pauseBtn.addEventListener('click', () => {
+    if (!moving) return;
+    paused = !paused;
+    pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+    if (!paused) { lastTime = null; requestAnimationFrame(loop); }
+  });
+
+  clearBtn.addEventListener('click', () => {
+    waypoints.length = 0; dense = []; uniform = []; totalLen = 0; travel = 0; moving = false; paused = false;
+    dot.x = (canvas.width/DPR)/2; dot.y = (canvas.height/DPR)/2;
+    rebuild(false);
+  });
+
+  speedRange.addEventListener('input', () => { speed = Number(speedRange.value); speedVal.textContent = speed + ' px/s'; rebuild(true); });
+  smoothChk.addEventListener('change', () => rebuild(true));
+  resInput.addEventListener('change', () => rebuild(true));
+  loopChk.addEventListener('change', () => { /* no-op; loop state read inside loop() */ });
+
+  function init() { dot.x = (canvas.width/DPR)/2; dot.y = (canvas.height/DPR)/2; rebuild(false); }
+  setTimeout(init,0);
+
+  canvas.addEventListener('mousedown', e=>e.preventDefault());
+})();
+</script>
+</body>
+</html>
